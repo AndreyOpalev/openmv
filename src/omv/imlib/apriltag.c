@@ -714,6 +714,10 @@ static inline float mod360(float vin)
     return mod360_positive(vin + 180) - 180;
 }
 
+static inline int mod_positive(int vin, int mod) {
+    return (vin % mod + mod) % mod;
+}
+
 static inline int theta_to_int(float theta, int max)
 {
     theta = mod2pi_ref(M_PI, theta);
