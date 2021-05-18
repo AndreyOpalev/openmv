@@ -5126,6 +5126,8 @@ struct quad
 {
     float p[4][2]; // corners
 
+    bool reversed_border;
+
     // H: tag coordinates ([-1,1] at the black corners) to pixels
     // Hinv: pixels to tag
     matd_t *H, *Hinv;
@@ -5141,18 +5143,28 @@ struct apriltag_family
     // How many codes are there in this tag family?
     uint32_t ncodes;
 
-    // how wide (in bit-sizes) is the black border? (usually 1)
-    uint32_t black_border;
+    int32_t width_at_border;
+    int32_t total_width;
+    int32_t d;
+    bool reversed_border;
 
-    // how many bits tall and wide is it? (e.g. 36bit tag ==> 6)
-    uint32_t d;
+    // The bit locations.
+    uint32_t nbits;
+    const uint32_t *bit_x;
+    const uint32_t *bit_y;
 
     // minimum hamming distance between any two codes. (e.g. 36h11 => 11)
     uint32_t h;
 
+    // some detector implementations may preprocess codes in order to
+    // accelerate decoding.  They put their data here. (Do not use the
+    // same apriltag_family instance in more than one implementation)
+    void *impl;
+
     // The codes in the family.
-    uint64_t codes[];
+    const uint64_t codes[];
 };
+
 
 struct apriltag_quad_thresh_params
 {
@@ -5167,6 +5179,7 @@ struct apriltag_quad_thresh_params
     // straight or close to 180 degrees. Zero means that no quads are
     // rejected. (In radians).
     float critical_rad;
+    float cos_critical_rad;
 
     // When fitting lines to the contours, what is the maximum mean
     // squared error allowed?  This is useful in rejecting contours
@@ -5194,6 +5207,18 @@ struct apriltag_detector
     ///////////////////////////////////////////////////////////////
     // User-configurable parameters.
 
+    // detection of quads can be done on a lower-resolution image,
+    // improving speed at a cost of pose accuracy and a slight
+    // decrease in detection rate. Decoding the binary payload is
+    // still done at full resolution. .
+    float quad_decimate;
+
+    // What Gaussian blur should be applied to the segmented image
+    // (used for quad detection?)  Parameter is the standard deviation
+    // in pixels.  Very noisy images benefit from non-zero values
+    // (e.g. 0.8).
+    float quad_sigma;
+
     // When non-zero, the edges of the each quad are adjusted to "snap
     // to" strong gradients nearby. This is useful when decimation is
     // employed, as it can increase the quality of the initial quad
@@ -5203,27 +5228,16 @@ struct apriltag_detector
     // quad_decimate = 1.
     int refine_edges;
 
-    // when non-zero, detections are refined in a way intended to
-    // increase the number of detected tags. Especially effective for
-    // very small tags near the resolution threshold (e.g. 10px on a
-    // side).
-    int refine_decode;
-
-    // when non-zero, detections are refined in a way intended to
-    // increase the accuracy of the extracted pose. This is done by
-    // maximizing the contrast around the black and white border of
-    // the tag. This generally increases the number of successfully
-    // detected tags, though not as effectively (or quickly) as
-    // refine_decode.
+    // How much sharpening should be done to decoded images? This
+    // can help decode small tags but may or may not help in odd
+    // lighting conditions or low light conditions.
     //
-    // This option must be enabled in order for "goodness" to be
-    // computed.
-    int refine_pose;
+    // The default value is 0.25.
+    double decode_sharpening;
 
     struct apriltag_quad_thresh_params qtp;
 
     ///////////////////////////////////////////////////////////////
-    // Statistics relating to last processed frame
 
     uint32_t nedges;
     uint32_t nsegments;
@@ -5255,11 +5269,6 @@ struct apriltag_detection
     // a hamming distance greater than 2.
     int hamming;
 
-    // A measure of the quality of tag localization: measures the
-    // average contrast of the pixels around the border of the
-    // tag. refine_pose must be enabled, or this field will be zero.
-    float goodness;
-
     // A measure of the quality of the binary decoding process: the
     // average difference between the intensity of a data bit versus
     // the decision threshold. Higher numbers roughly indicate better
@@ -5270,17 +5279,17 @@ struct apriltag_detection
     float decision_margin;
 
     // The 3x3 homography matrix describing the projection from an
-    // "ideal" tag (with corners at (-1,-1), (1,-1), (1,1), and (-1,
-    // 1)) to pixels in the image. This matrix will be freed by
+    // "ideal" tag (with corners at (-1,1), (1,1), (1,-1), and (-1,
+    // -1)) to pixels in the image. This matrix will be freed by
     // apriltag_detection_destroy.
     matd_t *H;
 
     // The center of the detection in image pixel coordinates.
-    float c[2];
+    double c[2];
 
     // The corners of the tag in image pixel coordinates. These always
     // wrap counter-clock wise around the tag.
-    float p[4][2];
+    double p[4][2];
 };
 
 // don't forget to add a family!
