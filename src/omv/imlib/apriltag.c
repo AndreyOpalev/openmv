@@ -9249,34 +9249,42 @@ typedef struct unionfind unionfind_t;
 
 struct unionfind
 {
+    uint32_t maxid;
     struct ufrec *data;
 };
 
 struct ufrec
 {
+#ifdef IMLIB_ENABLE_HIGH_RES_APRILTAGS
     // the parent of this node. If a node's parent is its own index,
     // then it is a root.
-#ifdef IMLIB_ENABLE_HIGH_RES_APRILTAGS
     uint32_t parent;
+
+    // for the root of a connected component, the number of components
+    // connected to it. For intermediate values, it's not meaningful.
+    uint32_t size;
 #else
     uint16_t parent;
+    uint16_t size;
 #endif
 };
 
 static inline unionfind_t *unionfind_create(uint32_t maxid)
 {
-    unionfind_t *uf = (unionfind_t*) fb_alloc(sizeof(unionfind_t), FB_ALLOC_NO_HINT);
+    unionfind_t *uf = (unionfind_t*) fb_alloc(sizeof (unionfind_t), FB_ALLOC_NO_HINT);
+    uf->maxid = maxid;
     uf->data = (struct ufrec*) fb_alloc((maxid+1) * sizeof(struct ufrec), FB_ALLOC_NO_HINT);
     for (int i = 0; i <= maxid; i++) {
+        uf->data[i].size = 1;
         uf->data[i].parent = i;
     }
     return uf;
 }
 
-static inline void unionfind_destroy()
+static inline void unionfind_destroy(unionfind_t *uf)
 {
-    fb_free();
-    fb_free();
+    fb_free();  //uf->data
+    fb_free();  //uf
 }
 
 /*
@@ -9308,10 +9316,6 @@ static inline uint32_t unionfind_get_representative(unionfind_t *uf, uint32_t id
     }
 
     // go back and collapse the tree.
-    //
-    // XXX: on some of our workloads that have very shallow trees
-    // (e.g. image segmentation), we are actually faster not doing
-    // this...
     while (uf->data[id].parent != root) {
         uint32_t tmp = uf->data[id].parent;
         uf->data[id].parent = root;
@@ -9321,15 +9325,44 @@ static inline uint32_t unionfind_get_representative(unionfind_t *uf, uint32_t id
     return root;
 }
 
+static inline uint32_t unionfind_get_set_size(unionfind_t *uf, uint32_t id)
+{
+    uint32_t repid = unionfind_get_representative(uf, id);
+    return uf->data[repid].size;
+}
+
 static inline uint32_t unionfind_connect(unionfind_t *uf, uint32_t aid, uint32_t bid)
 {
     uint32_t aroot = unionfind_get_representative(uf, aid);
     uint32_t broot = unionfind_get_representative(uf, bid);
 
-    if (aroot != broot)
-        uf->data[broot].parent = aroot;
+    if (aroot == broot)
+        return aroot;
 
-    return aroot;
+    // we don't perform "union by rank", but we perform a similar
+    // operation (but probably without the same asymptotic guarantee):
+    // We join trees based on the number of *elements* (as opposed to
+    // rank) contained within each tree. I.e., we use size as a proxy
+    // for rank.  In my testing, it's often *faster* to use size than
+    // rank, perhaps because the rank of the tree isn't that critical
+    // if there are very few nodes in it.
+    uint32_t asize = uf->data[aroot].size;
+    uint32_t bsize = uf->data[broot].size;
+
+    // optimization idea: We could shortcut some or all of the tree
+    // that is grafted onto the other tree. Pro: those nodes were just
+    // read and so are probably in cache. Con: it might end up being
+    // wasted effort -- the tree might be grafted onto another tree in
+    // a moment!
+    if (asize > bsize) {
+        uf->data[broot].parent = aroot;
+        uf->data[aroot].size += bsize;
+        return aroot;
+    } else {
+        uf->data[aroot].parent = broot;
+        uf->data[broot].size += asize;
+        return broot;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
