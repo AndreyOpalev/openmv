@@ -9379,7 +9379,6 @@ static inline uint32_t unionfind_connect(unionfind_t *uf, uint32_t aid, uint32_t
 
 static inline uint32_t u64hash_2(uint64_t x) {
     return (2654435761 * x) >> 32;
-    return (uint32_t) x;
 }
 
 struct uint32_zarray_entry
@@ -9398,8 +9397,9 @@ struct pt
 {
     // Note: these represent 2*actual value.
     uint16_t x, y;
-    float theta;
     int16_t gx, gy;
+
+    float slope;
 };
 
 struct remove_vertex
@@ -9426,100 +9426,13 @@ struct line_fit_pt
     float W; // total weight
 };
 
-static inline void ptsort(struct pt *pts, int sz)
+struct cluster_hash
 {
-#define MAYBE_SWAP(arr,apos,bpos)                                   \
-    if (arr[apos].theta > arr[bpos].theta) {                        \
-        tmp = arr[apos]; arr[apos] = arr[bpos]; arr[bpos] = tmp;    \
-    };
+    uint32_t hash;
+    uint32_t id;
+    zarray_t* data;
+};
 
-    if (sz <= 1)
-        return;
-
-    if (sz == 2) {
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1);
-        return;
-    }
-
-    // NB: Using less-branch-intensive sorting networks here on the
-    // hunch that it's better for performance.
-    if (sz == 3) { // 3 element bubble sort is optimal
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1);
-        MAYBE_SWAP(pts, 1, 2);
-        MAYBE_SWAP(pts, 0, 1);
-        return;
-    }
-
-    if (sz == 4) { // 4 element optimal sorting network.
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1); // sort each half, like a merge sort
-        MAYBE_SWAP(pts, 2, 3);
-        MAYBE_SWAP(pts, 0, 2); // minimum value is now at 0.
-        MAYBE_SWAP(pts, 1, 3); // maximum value is now at end.
-        MAYBE_SWAP(pts, 1, 2); // that only leaves the middle two.
-        return;
-    }
-
-    if (sz == 5) {
-        // this 9-step swap is optimal for a sorting network, but two
-        // steps slower than a generic sort.
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
-        MAYBE_SWAP(pts, 3, 4);
-        MAYBE_SWAP(pts, 1, 2);
-        MAYBE_SWAP(pts, 0, 1);
-        MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
-        MAYBE_SWAP(pts, 2, 4); // maximum element now at end
-        MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
-        MAYBE_SWAP(pts, 2, 3);
-        MAYBE_SWAP(pts, 1, 2);
-        return;
-    }
-
-#undef MAYBE_SWAP
-
-    // a merge sort with temp storage.
-
-    struct pt *tmp = fb_alloc(sizeof(struct pt) * sz, FB_ALLOC_NO_HINT);
-
-    memcpy(tmp, pts, sizeof(struct pt) * sz);
-
-    int asz = sz/2;
-    int bsz = sz - asz;
-
-    struct pt *as = &tmp[0];
-    struct pt *bs = &tmp[asz];
-
-    ptsort(as, asz);
-    ptsort(bs, bsz);
-
-#define MERGE(apos,bpos)                        \
-    if (as[apos].theta < bs[bpos].theta)        \
-        pts[outpos++] = as[apos++];             \
-    else                                        \
-        pts[outpos++] = bs[bpos++];
-
-    int apos = 0, bpos = 0, outpos = 0;
-    while (apos + 8 < asz && bpos + 8 < bsz) {
-        MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos);
-        MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos);
-    }
-
-    while (apos < asz && bpos < bsz) {
-        MERGE(apos,bpos);
-    }
-
-    if (apos < asz)
-        memcpy(&pts[outpos], &as[apos], (asz-apos)*sizeof(struct pt));
-    if (bpos < bsz)
-        memcpy(&pts[outpos], &bs[bpos], (bsz-bpos)*sizeof(struct pt));
-
-    fb_free(); // tmp
-
-#undef MERGE
-}
 
 // lfps contains *cumulative* moments for N points, with
 // index j reflecting points [0,j] (inclusive).
@@ -9582,57 +9495,46 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, float *lineparm,
     float Cxy = Mxy / W - Ex*Ey;
     float Cyy = Myy / W - Ey*Ey;
 
-    float nx, ny;
+    //if (1) {
+    //    // on iOS about 5% of total CPU spent in these trig functions.
+    //    // 85 ms per frame on 5S, example.pnm
+    //    //
+    //    // XXX this was using the double-precision atan2. Was there a case where
+    //    // we needed that precision? Seems doubtful.
+    //    double normal_theta = .5 * atan2f(-2*Cxy, (Cyy - Cxx));
+    //    nx_old = cosf(normal_theta);
+    //    ny_old = sinf(normal_theta);
+    //}
 
-    if (1) {
-        // on iOS about 5% of total CPU spent in these trig functions.
-        // 85 ms per frame on 5S, example.pnm
-        //
-        // XXX this was using the float-precision atan2. Was there a case where
-        // we needed that precision? Seems doubtful.
-        float normal_theta = .5 * atan2f(-2*Cxy, (Cyy - Cxx));
-        nx = cosf(normal_theta);
-        ny = sinf(normal_theta);
-    } else {
-        // 73.5 ms per frame on 5S, example.pnm
-        float ty = -2*Cxy;
-        float tx = (Cyy - Cxx);
-        float mag = ty*ty + tx*tx;
-
-        if (mag == 0) {
-            nx = 1;
-            ny = 0;
-        } else {
-            float norm = sqrtf(ty*ty + tx*tx);
-            tx /= norm;
-
-            // ty is now sin(2theta)
-            // tx is now cos(2theta). We want sin(theta) and cos(theta)
-
-            // due to precision err, tx could still have slightly too large magnitude.
-            if (tx > 1) {
-                ny = 0;
-                nx = 1;
-            } else if (tx < -1) {
-                ny = 1;
-                nx = 0;
-            } else {
-                // half angle formula
-                ny = sqrtf((1 - tx)/2);
-                nx = sqrtf((1 + tx)/2);
-
-                // pick a consistent branch cut
-                if (ty < 0)
-                    ny = - ny;
-            }
-        }
-    }
+    // Instead of using the above cos/sin method, pose it as an eigenvalue problem.
+    float eig_small = 0.5*(Cxx + Cyy - sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
 
     if (lineparm) {
         lineparm[0] = Ex;
         lineparm[1] = Ey;
-        lineparm[2] = nx;
-        lineparm[3] = ny;
+
+        float eig = 0.5*(Cxx + Cyy + sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
+        float nx1 = Cxx - eig;
+        float ny1 = Cxy;
+        float M1 = nx1*nx1 + ny1*ny1;
+        float nx2 = Cxy;
+        float ny2 = Cyy - eig;
+        float M2 = nx2*nx2 + ny2*ny2;
+
+        float nx, ny, M;
+        if (M1 > M2) {
+            nx = nx1;
+            ny = ny1;
+            M = M1;
+        } else {
+            nx = nx2;
+            ny = ny2;
+            M = M2;
+        }
+
+        float length = sqrtf(M);
+        lineparm[2] = nx/length;
+        lineparm[3] = ny/length;
     }
 
     // sum of squared errors =
@@ -9645,19 +9547,15 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, float *lineparm,
 
     // sum of squared errors
     if (err)
-        *err = nx*nx*N*Cxx + 2*nx*ny*N*Cxy + ny*ny*N*Cyy;
+        *err = N*eig_small;
 
     // mean squared error
     if (mse)
-        *mse = nx*nx*Cxx + 2*nx*ny*Cxy + ny*ny*Cyy;
+        *mse = eig_small;
 }
 
-int pt_compare_theta(const void *_a, const void *_b)
-{
-    struct pt *a = (struct pt*) _a;
-    struct pt *b = (struct pt*) _b;
-
-    return (a->theta < b->theta) ? -1 : 1;
+float pt_compare_angle(struct pt *a, struct pt *b) {
+    return a->slope - b->slope;
 }
 
 int err_compare_descending(const void *_a, const void *_b)
@@ -9705,9 +9603,8 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     if (ksz < 2)
         return 0;
 
-//    printf("sz %5d, ksz %3d\n", sz, ksz);
+    float *errs = fb_alloc(sizeof(float)*sz, FB_ALLOC_NO_HINT);
 
-    float *errs = fb_alloc(sz * sizeof(float), FB_ALLOC_NO_HINT);
 
     for (int i = 0; i < sz; i++) {
         fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz, NULL, &errs[i], NULL);
@@ -9715,7 +9612,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 
     // apply a low-pass filter to errs
     if (1) {
-        float *y = fb_alloc(sz * sizeof(float), FB_ALLOC_NO_HINT);
+        float *y = fb_alloc(sizeof(float)*sz, FB_ALLOC_NO_HINT);
 
         // how much filter to apply?
 
@@ -9737,7 +9634,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 
         // For default values of cutoff = 0.05, sigma = 3,
         // we have fsz = 17.
-        float *f = fb_alloc(fsz * sizeof(float), FB_ALLOC_NO_HINT);
+        float *f = fb_alloc(sizeof(float)*fsz, FB_ALLOC_NO_HINT);
 
         for (int i = 0; i < fsz; i++) {
             int j = i - fsz / 2;
@@ -9746,29 +9643,20 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 
         for (int iy = 0; iy < sz; iy++) {
             float acc = 0;
-#ifdef OPTIMIZED
-            int index = (iy - fsz/2 + sz) % sz;
-            for (int i = 0; i < fsz; i++) {
-                acc += errs[index] * f[i];
-                index++;
-                if (index >= sz) // faster to compare than divide (%)
-                   index -= sz;
-            }
-#else
+
             for (int i = 0; i < fsz; i++) {
                 acc += errs[(iy + i - fsz / 2 + sz) % sz] * f[i];
             }
-#endif
             y[iy] = acc;
         }
 
+        memcpy(errs, y, sizeof(float)*sz);
         fb_free(); // f
-        memcpy(errs, y, sz * sizeof(float));
         fb_free(); // y
     }
 
-    int *maxima = fb_alloc(sz * sizeof(int), FB_ALLOC_NO_HINT);
-    float *maxima_errs = fb_alloc(sz * sizeof(float), FB_ALLOC_NO_HINT);
+    int *maxima = fb_alloc(sizeof(int)*sz, FB_ALLOC_NO_HINT);
+    float *maxima_errs = fb_alloc(sizeof(float)*sz, FB_ALLOC_NO_HINT);
     int nmaxima = 0;
 
     for (int i = 0; i < sz; i++) {
@@ -9780,15 +9668,19 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     }
 
     // if we didn't get at least 4 maxima, we can't fit a quad.
-    if (nmaxima < 4)
+    if (nmaxima < 4){
+        fb_free();//(maxima_errs);
+        fb_free();//(maxima);
+        fb_free();//(errs);
         return 0;
+    }
 
     // select only the best maxima if we have too many
     int max_nmaxima = td->qtp.max_nmaxima;
 
     if (nmaxima > max_nmaxima) {
-        float *maxima_errs_copy = fb_alloc(nmaxima * sizeof(float), FB_ALLOC_NO_HINT);
-        memcpy(maxima_errs_copy, maxima_errs, nmaxima * sizeof(float));
+        float *maxima_errs_copy = fb_alloc(sizeof(float)*nmaxima, FB_ALLOC_NO_HINT);
+        memcpy(maxima_errs_copy, maxima_errs, sizeof(float)*nmaxima);
 
         // throw out all but the best handful of maxima. Sorts descending.
         qsort(maxima_errs_copy, nmaxima, sizeof(float), err_compare_descending);
@@ -9801,13 +9693,8 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
             maxima[out++] = maxima[in];
         }
         nmaxima = out;
-
-        fb_free(); // maxima_errs_copy
+        fb_free(); //(maxima_errs_copyi);
     }
-
-    fb_free(); // maxima_errs
-    fb_free(); // maxima
-    fb_free(); // errs
 
     int best_indices[4];
     float best_error = HUGE_VALF;
@@ -9817,7 +9704,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     float params01[4], params12[4], params23[4], params30[4];
 
     // disallow quads where the angle is less than a critical value.
-    float max_dot = cos(td->qtp.critical_rad); //25*M_PI/180);
+    float max_dot = td->qtp.cos_critical_rad; //25*M_PI/180);
 
     for (int m0 = 0; m0 < nmaxima - 3; m0++) {
         int i0 = maxima[m0];
@@ -9865,6 +9752,10 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
         }
     }
 
+    fb_free(); // maxima_errs
+    fb_free(); // maxima;
+    fb_free(); //(errs);
+
     if (best_error == HUGE_VALF)
         return 0;
 
@@ -9876,13 +9767,270 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     return 0;
 }
 
-// return 1 if the quad looks okay, 0 if it should be discarded
-int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct quad *quad, bool overrideMode)
+// returns 0 if the cluster looks bad.
+// int quad_segment_agg(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
+// {
+//     int sz = zarray_size(cluster);
+
+//     zmaxheap_t *heap = zmaxheap_create(sizeof(struct remove_vertex*));
+
+//     // We will initially allocate sz rvs. We then have two types of
+//     // iterations: some iterations that are no-ops in terms of
+//     // allocations, and those that remove a vertex and allocate two
+//     // more children.  This will happen at most (sz-4) times.  Thus we
+//     // need: sz + 2*(sz-4) entries.
+
+//     int rvalloc_pos = 0;
+//     int rvalloc_size = 3*sz;
+//     struct remove_vertex *rvalloc = fb_alloc(rvalloc_size * sizeof(struct remove_vertex), FB_ALLOC_NO_HINT);
+//     struct segment *segs = fb_alloc(sz * sizeof(struct segment), FB_ALLOC_NO_HINT);
+
+
+//     // populate with initial entries
+//     for (int i = 0; i < sz; i++) {
+//         struct remove_vertex *rv = &rvalloc[rvalloc_pos++];
+//         rv->i = i;
+//         if (i == 0) {
+//             rv->left = sz-1;
+//             rv->right = 1;
+//         } else {
+//             rv->left  = i-1;
+//             rv->right = (i+1) % sz;
+//         }
+
+//         fit_line(lfps, sz, rv->left, rv->right, NULL, NULL, &rv->err);
+
+//         zmaxheap_add(heap, &rv, -rv->err);
+
+//         segs[i].left = rv->left;
+//         segs[i].right = rv->right;
+//         segs[i].is_vertex = 1;
+//     }
+
+//     int nvertices = sz;
+
+//     while (nvertices > 4) {
+//         assert(rvalloc_pos < rvalloc_size);
+
+//         struct remove_vertex *rv;
+//         float err;
+
+//         int res = zmaxheap_remove_max(heap, &rv, &err);
+//         if (!res)
+//             return 0;
+//         assert(res);
+
+//         // is this remove_vertex valid? (Or has one of the left/right
+//         // vertices changes since we last looked?)
+//         if (!segs[rv->i].is_vertex ||
+//             !segs[rv->left].is_vertex ||
+//             !segs[rv->right].is_vertex) {
+//             continue;
+//         }
+
+//         // we now merge.
+//         assert(segs[rv->i].is_vertex);
+
+//         segs[rv->i].is_vertex = 0;
+//         segs[rv->left].right = rv->right;
+//         segs[rv->right].left = rv->left;
+
+//         // create the join to the left
+//         if (1) {
+//             struct remove_vertex *child = &rvalloc[rvalloc_pos++];
+//             child->i = rv->left;
+//             child->left = segs[rv->left].left;
+//             child->right = rv->right;
+
+//             fit_line(lfps, sz, child->left, child->right, NULL, NULL, &child->err);
+
+//             zmaxheap_add(heap, &child, -child->err);
+//         }
+
+//         // create the join to the right
+//         if (1) {
+//             struct remove_vertex *child = &rvalloc[rvalloc_pos++];
+//             child->i = rv->right;
+//             child->left = rv->left;
+//             child->right = segs[rv->right].right;
+
+//             fit_line(lfps, sz, child->left, child->right, NULL, NULL, &child->err);
+
+//             zmaxheap_add(heap, &child, -child->err);
+//         }
+
+//         // we now have one less vertex
+//         nvertices--;
+//     }
+
+//     zmaxheap_destroy(heap);
+
+//     int idx = 0;
+//     for (int i = 0; i < sz; i++) {
+//         if (segs[i].is_vertex) {
+//             indices[idx++] = i;
+//         }
+//     }
+
+//     fb_free(); // rvalloc
+//     fb_free(); // segs
+
+//     return 1;
+// }
+
+/**
+ * Compute statistics that allow line fit queries to be
+ * efficiently computed for any contiguous range of indices.
+ */
+struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
+    struct line_fit_pt *lfps = fb_alloc0(sz * sizeof(struct line_fit_pt), FB_ALLOC_NO_HINT);
+
+    for (int i = 0; i < sz; i++) {
+        struct pt *p;
+        zarray_get_volatile(cluster, i, &p);
+
+        if (i > 0) {
+            memcpy(&lfps[i], &lfps[i-1], sizeof(struct line_fit_pt));
+        }
+
+        {
+            // we now undo our fixed-point arithmetic.
+            float delta = 0.5; // adjust for pixel center bias
+            float x = p->x * .5 + delta;
+            float y = p->y * .5 + delta;
+            int ix = x, iy = y;
+            float W = 1;
+
+            if (ix > 0 && ix+1 < im->width && iy > 0 && iy+1 < im->height) {
+                int grad_x = im->buf[iy * im->stride + ix + 1] -
+                    im->buf[iy * im->stride + ix - 1];
+
+                int grad_y = im->buf[(iy+1) * im->stride + ix] -
+                    im->buf[(iy-1) * im->stride + ix];
+
+                // XXX Tunable. How to shape the gradient magnitude?
+                W = sqrt(grad_x*grad_x + grad_y*grad_y) + 1;
+            }
+
+            float fx = x, fy = y;
+            lfps[i].Mx  += W * fx;
+            lfps[i].My  += W * fy;
+            lfps[i].Mxx += W * fx * fx;
+            lfps[i].Mxy += W * fx * fy;
+            lfps[i].Myy += W * fy * fy;
+            lfps[i].W   += W;
+        }
+    }
+    return lfps;
+}
+
+static inline void ptsort(struct pt *pts, int sz)
 {
+#define MAYBE_SWAP(arr,apos,bpos)                                   \
+    if (pt_compare_angle(&(arr[apos]), &(arr[bpos])) > 0) {                        \
+        tmp = arr[apos]; arr[apos] = arr[bpos]; arr[bpos] = tmp;    \
+    };
+
+    if (sz <= 1)
+        return;
+
+    if (sz == 2) {
+        struct pt tmp;
+        MAYBE_SWAP(pts, 0, 1);
+        return;
+    }
+
+    // NB: Using less-branch-intensive sorting networks here on the
+    // hunch that it's better for performance.
+    if (sz == 3) { // 3 element bubble sort is optimal
+        struct pt tmp;
+        MAYBE_SWAP(pts, 0, 1);
+        MAYBE_SWAP(pts, 1, 2);
+        MAYBE_SWAP(pts, 0, 1);
+        return;
+    }
+
+    if (sz == 4) { // 4 element optimal sorting network.
+        struct pt tmp;
+        MAYBE_SWAP(pts, 0, 1); // sort each half, like a merge sort
+        MAYBE_SWAP(pts, 2, 3);
+        MAYBE_SWAP(pts, 0, 2); // minimum value is now at 0.
+        MAYBE_SWAP(pts, 1, 3); // maximum value is now at end.
+        MAYBE_SWAP(pts, 1, 2); // that only leaves the middle two.
+        return;
+    }
+    if (sz == 5) {
+        // this 9-step swap is optimal for a sorting network, but two
+        // steps slower than a generic sort.
+        struct pt tmp;
+        MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
+        MAYBE_SWAP(pts, 3, 4);
+        MAYBE_SWAP(pts, 1, 2);
+        MAYBE_SWAP(pts, 0, 1);
+        MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
+        MAYBE_SWAP(pts, 2, 4); // maximum element now at end
+        MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
+        MAYBE_SWAP(pts, 2, 3);
+        MAYBE_SWAP(pts, 1, 2);
+        return;
+    }
+
+#undef MAYBE_SWAP
+
+    // a merge sort with temp storage.
+
+    struct pt *tmp = fb_alloc(sizeof(struct pt) * sz, FB_ALLOC_NO_HINT);
+
+    memcpy(tmp, pts, sizeof(struct pt) * sz);
+
+    int asz = sz/2;
+    int bsz = sz - asz;
+
+    struct pt *as = &tmp[0];
+    struct pt *bs = &tmp[asz];
+
+    ptsort(as, asz);
+    ptsort(bs, bsz);
+
+    #define MERGE(apos,bpos)                        \
+    if (pt_compare_angle(&(as[apos]), &(bs[bpos])) < 0)        \
+        pts[outpos++] = as[apos++];             \
+    else                                        \
+        pts[outpos++] = bs[bpos++];
+
+    int apos = 0, bpos = 0, outpos = 0;
+    while (apos + 8 < asz && bpos + 8 < bsz) {
+        MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos);
+        MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos); MERGE(apos,bpos);
+    }
+
+    while (apos < asz && bpos < bsz) {
+        MERGE(apos,bpos);
+    }
+
+    if (apos < asz)
+        memcpy(&pts[outpos], &as[apos], (asz-apos)*sizeof(struct pt));
+    if (bpos < bsz)
+        memcpy(&pts[outpos], &bs[bpos], (bsz-bpos)*sizeof(struct pt));
+
+    fb_free(); //tmp
+
+#undef MERGE
+}
+
+// return 1 if the quad looks okay, 0 if it should be discarded
+int fit_quad(
+        apriltag_detector_t *td,
+        image_u8_t *im,
+        zarray_t *cluster,
+        struct quad *quad,
+        int tag_width,
+        bool normal_border,
+        bool reversed_border) {
     int res = 0;
 
     int sz = zarray_size(cluster);
-    if (sz < 4) // can't fit a quad to less than 4 points
+    if (sz < 24) // Synchronize with later check.
         return 0;
 
     /////////////////////////////////////////////////////////////
@@ -9892,17 +10040,31 @@ int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct 
 
     // compute a bounding box so that we can order the points
     // according to their angle WRT the center.
-    int32_t xmax = 0, xmin = INT32_MAX, ymax = 0, ymin = INT32_MAX;
-
-    for (int pidx = 0; pidx < zarray_size(cluster); pidx++) {
+    struct pt *p1;
+    zarray_get_volatile(cluster, 0, &p1);
+    uint16_t xmax = p1->x;
+    uint16_t xmin = p1->x;
+    uint16_t ymax = p1->y;
+    uint16_t ymin = p1->y;
+    for (int pidx = 1; pidx < zarray_size(cluster); pidx++) {
         struct pt *p;
         zarray_get_volatile(cluster, pidx, &p);
 
-        xmax = imax(xmax, p->x);
-        xmin = imin(xmin, p->x);
+        if (p->x > xmax) {
+            xmax = p->x;
+        } else if (p->x < xmin) {
+            xmin = p->x;
+        }
 
-        ymax = imax(ymax, p->y);
-        ymin = imin(ymin, p->y);
+        if (p->y > ymax) {
+            ymax = p->y;
+        } else if (p->y < ymin) {
+            ymin = p->y;
+        }
+    }
+
+    if ((xmax - xmin)*(ymax - ymin) < tag_width) {
+        return 0;
     }
 
     // add some noise to (cx,cy) so that pixels get a more diverse set
@@ -9915,6 +10077,8 @@ int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct 
 
     float dot = 0;
 
+    float quadrants[2][2] = {{-1*(2 << 15), 0}, {2*(2 << 15), 2 << 15}};
+
     for (int pidx = 0; pidx < zarray_size(cluster); pidx++) {
         struct pt *p;
         zarray_get_volatile(cluster, pidx, &p);
@@ -9922,20 +10086,34 @@ int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct 
         float dx = p->x - cx;
         float dy = p->y - cy;
 
-        p->theta = atan2f(dy, dx);
-
         dot += dx*p->gx + dy*p->gy;
-//        p->theta = terrible_atan2(dy, dx);
+
+        float quadrant = quadrants[dy > 0][dx > 0];
+        if (dy < 0) {
+            dy = -dy;
+            dx = -dx;
+        }
+
+        if (dx < 0) {
+            float tmp = dx;
+            dx = dy;
+            dy = -tmp;
+        }
+        p->slope = quadrant + dy/dx;
     }
 
     // Ensure that the black border is inside the white border.
-    if ((!overrideMode) && (dot < 0))
+    quad->reversed_border = dot < 0;
+    if (!reversed_border && quad->reversed_border) {
         return 0;
+    }
+    if (!normal_border && !quad->reversed_border) {
+        return 0;
+    }
 
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        //        zarray_sort(cluster, pt_compare_theta);
         ptsort((struct pt*) cluster->data, zarray_size(cluster));
 
         // remove duplicate points. (A byproduct of our segmentation system.)
@@ -9968,242 +10146,77 @@ int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct 
             sz = outpos;
         }
 
-    } else {
-        // This is a counting sort in which we retain at most one
-        // point for every bucket; the bucket index is computed from
-        // theta. Since a good quad completes a complete revolution,
-        // there's reason to think that we should get a good
-        // distribution of thetas.  We might "lose" a few points due
-        // to collisions, but this shouldn't affect quality very much.
-
-        // XXX tunable. Increase to reduce the likelihood of "losing"
-        // points due to collisions.
-        int nbuckets = 4*sz;
-
-#define ASSOC 2
-        struct pt v[nbuckets][ASSOC];
-        memset(v, 0, sizeof(v));
-
-        // put each point into a bucket.
-        for (int i = 0; i < sz; i++) {
-            struct pt *p;
-            zarray_get_volatile(cluster, i, &p);
-
-            assert(p->theta >= -M_PI && p->theta <= M_PI);
-
-            int bucket = (nbuckets - 1) * (p->theta + M_PI) / (2*M_PI);
-            assert(bucket >= 0 && bucket < nbuckets);
-
-            for (int i = 0; i < ASSOC; i++) {
-                if (v[bucket][i].theta == 0) {
-                    v[bucket][i] = *p;
-                    break;
-                }
-            }
-        }
-
-        // collect the points from the buckets and put them back into the array.
-        int outsz = 0;
-        for (int i = 0; i < nbuckets; i++) {
-            for (int j = 0; j < ASSOC; j++) {
-                if (v[i][j].theta != 0) {
-                    zarray_set(cluster, outsz, &v[i][j], NULL);
-                    outsz++;
-                }
-            }
-        }
-
-        zarray_truncate(cluster, outsz);
-        sz = outsz;
     }
 
-    if (sz < 4)
+    if (sz < 24)
         return 0;
 
-    /////////////////////////////////////////////////////////////
-    // Step 2. Precompute statistics that allow line fit queries to be
-    // efficiently computed for any contiguous range of indices.
 
-    struct line_fit_pt *lfps = fb_alloc0(sz * sizeof(struct line_fit_pt), FB_ALLOC_NO_HINT);
-
-    for (int i = 0; i < sz; i++) {
-        struct pt *p;
-        zarray_get_volatile(cluster, i, &p);
-
-        if (i > 0) {
-            memcpy(&lfps[i], &lfps[i-1], sizeof(struct line_fit_pt));
-        }
-
-        if (0) {
-            // we now undo our fixed-point arithmetic.
-            float delta = 0.5;
-            float x = p->x * .5 + delta;
-            float y = p->y * .5 + delta;
-            float W;
-
-            for (int dy = -1; dy <= 1; dy++) {
-                int iy = y + dy;
-
-                if (iy < 0 || iy + 1 >= im->height)
-                    continue;
-
-                for (int dx = -1; dx <= 1; dx++) {
-                    int ix = x + dx;
-
-                    if (ix < 0 || ix + 1 >= im->width)
-                        continue;
-
-                    int grad_x = im->buf[iy * im->stride + ix + 1] -
-                        im->buf[iy * im->stride + ix - 1];
-
-                    int grad_y = im->buf[(iy+1) * im->stride + ix] -
-                        im->buf[(iy-1) * im->stride + ix];
-
-                    W = sqrtf(grad_x*grad_x + grad_y*grad_y) + 1;
-
-//                    float fx = x + dx, fy = y + dy;
-                    float fx = ix + .5, fy = iy + .5;
-                    lfps[i].Mx  += W * fx;
-                    lfps[i].My  += W * fy;
-                    lfps[i].Mxx += W * fx * fx;
-                    lfps[i].Mxy += W * fx * fy;
-                    lfps[i].Myy += W * fy * fy;
-                    lfps[i].W   += W;
-                }
-            }
-        } else {
-            // we now undo our fixed-point arithmetic.
-            float delta = 0.5; // adjust for pixel center bias
-            float x = p->x * .5 + delta;
-            float y = p->y * .5 + delta;
-            int ix = x, iy = y;
-            float W = 1;
-
-            if (ix > 0 && ix+1 < im->width && iy > 0 && iy+1 < im->height) {
-                int grad_x = im->buf[iy * im->stride + ix + 1] -
-                    im->buf[iy * im->stride + ix - 1];
-
-                int grad_y = im->buf[(iy+1) * im->stride + ix] -
-                    im->buf[(iy-1) * im->stride + ix];
-
-                // XXX Tunable. How to shape the gradient magnitude?
-                W = sqrt(grad_x*grad_x + grad_y*grad_y) + 1;
-            }
-
-            float fx = x, fy = y;
-            lfps[i].Mx  += W * fx;
-            lfps[i].My  += W * fy;
-            lfps[i].Mxx += W * fx * fx;
-            lfps[i].Mxy += W * fx * fy;
-            lfps[i].Myy += W * fy * fy;
-            lfps[i].W   += W;
-        }
-    }
+    struct line_fit_pt *lfps = compute_lfps(sz, cluster, im);
 
     int indices[4];
     if (1) {
         if (!quad_segment_maxima(td, cluster, lfps, indices))
             goto finish;
+    } else {
+        // if (!quad_segment_agg(td, cluster, lfps, indices))
+            // goto finish;
     }
 
-//    printf("%d %d %d %d\n", indices[0], indices[1], indices[2], indices[3]);
 
-    if (0) {
-        // no refitting here; just use those points as the vertices.
-        // Note, this is useful for debugging, but pretty bad in
-        // practice since this code path also omits several
-        // plausibility checks that save us tons of time in quad
-        // decoding.
-        for (int i = 0; i < 4; i++) {
-            struct pt *p;
-            zarray_get_volatile(cluster, indices[i], &p);
+    float lines[4][4];
 
-            quad->p[i][0] = .5*p->x; // undo fixed-point arith.
-            quad->p[i][1] = .5*p->y;
+    for (int i = 0; i < 4; i++) {
+        int i0 = indices[i];
+        int i1 = indices[(i+1)&3];
+
+        float err;
+        fit_line(lfps, sz, i0, i1, lines[i], NULL, &err);
+
+        if (err > td->qtp.max_line_fit_mse) {
+            res = 0;
+            goto finish;
         }
+    }
+
+    for (int i = 0; i < 4; i++) {
+        // solve for the intersection of lines (i) and (i+1)&3.
+        // p0 + lambda0*u0 = p1 + lambda1*u1, where u0 and u1
+        // are the line directions.
+        //
+        // lambda0*u0 - lambda1*u1 = (p1 - p0)
+        //
+        // rearrange (solve for lambdas)
+        //
+        // [u0_x   -u1_x ] [lambda0] = [ p1_x - p0_x ]
+        // [u0_y   -u1_y ] [lambda1]   [ p1_y - p0_y ]
+        //
+        // remember that lines[i][0,1] = p, lines[i][2,3] = NORMAL vector.
+        // We want the unit vector, so we need the perpendiculars. Thus, below
+        // we have swapped the x and y components and flipped the y components.
+
+        float A00 =  lines[i][3],  A01 = -lines[(i+1)&3][3];
+        float A10 =  -lines[i][2],  A11 = lines[(i+1)&3][2];
+        float B0 = -lines[i][0] + lines[(i+1)&3][0];
+        float B1 = -lines[i][1] + lines[(i+1)&3][1];
+
+        float det = A00 * A11 - A10 * A01;
+
+        // inverse.
+        float W00 = A11 / det, W01 = -A01 / det;
+        if (fabs(det) < 0.001) {
+            res = 0;
+            goto finish;
+        }
+
+        // solve
+        float L0 = W00*B0 + W01*B1;
+
+        // compute intersection
+        quad->p[i][0] = lines[i][0] + L0*A00;
+        quad->p[i][1] = lines[i][1] + L0*A10;
 
         res = 1;
-
-    } else {
-        float lines[4][4];
-
-        for (int i = 0; i < 4; i++) {
-            int i0 = indices[i];
-            int i1 = indices[(i+1)&3];
-
-            if (0) {
-                // if there are enough points, skip the points near the corners
-                // (because those tend not to be very good.)
-                if (i1-i0 > 8) {
-                    int t = (i1-i0)/6;
-                    if (t < 0)
-                        t = -t;
-
-                    i0 = (i0 + t) % sz;
-                    i1 = (i1 + sz - t) % sz;
-                }
-            }
-
-            float err;
-            fit_line(lfps, sz, i0, i1, lines[i], NULL, &err);
-
-            if (err > td->qtp.max_line_fit_mse) {
-                res = 0;
-                goto finish;
-            }
-        }
-
-        for (int i = 0; i < 4; i++) {
-            // solve for the intersection of lines (i) and (i+1)&3.
-            // p0 + lambda0*u0 = p1 + lambda1*u1, where u0 and u1
-            // are the line directions.
-            //
-            // lambda0*u0 - lambda1*u1 = (p1 - p0)
-            //
-            // rearrange (solve for lambdas)
-            //
-            // [u0_x   -u1_x ] [lambda0] = [ p1_x - p0_x ]
-            // [u0_y   -u1_y ] [lambda1]   [ p1_y - p0_y ]
-            //
-            // remember that lines[i][0,1] = p, lines[i][2,3] = NORMAL vector.
-            // We want the unit vector, so we need the perpendiculars. Thus, below
-            // we have swapped the x and y components and flipped the y components.
-
-            float A00 =  lines[i][3],  A01 = -lines[(i+1)&3][3];
-            float A10 =  -lines[i][2],  A11 = lines[(i+1)&3][2];
-            float B0 = -lines[i][0] + lines[(i+1)&3][0];
-            float B1 = -lines[i][1] + lines[(i+1)&3][1];
-
-            float det = A00 * A11 - A10 * A01;
-
-            // inverse.
-            float W00 = A11 / det, W01 = -A01 / det;
-            if (fabs(det) < 0.001) {
-                res = 0;
-                goto finish;
-            }
-
-            // solve
-            float L0 = W00*B0 + W01*B1;
-
-            // compute intersection
-            quad->p[i][0] = lines[i][0] + L0*A00;
-            quad->p[i][1] = lines[i][1] + L0*A10;
-
-            if (0) {
-                // we should get the same intersection starting
-                // from point p1 and moving L1*u1.
-                float W10 = -A10 / det, W11 = A00 / det;
-                float L1 = W10*B0 + W11*B1;
-
-                float x = lines[(i+1)&3][0] - L1*A10;
-                float y = lines[(i+1)&3][1] - L1*A11;
-                assert(fabs(x - quad->p[i][0]) < 0.001 &&
-                       fabs(y - quad->p[i][1]) < 0.001);
-            }
-
-            res = 1;
-        }
     }
 
     // reject quads that are too small
@@ -10234,11 +10247,7 @@ int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct 
 
         area += sqrt(p*(p-length[0])*(p-length[1])*(p-length[2]));
 
-        // we don't actually know the family yet (quad detection is generic.)
-        // This threshold is based on a 6x6 tag (which is actually 8x8)
-//        int d = fam->d + fam->black_border*2;
-        int d = 8;
-        if (area < d*d) {
+        if (area < tag_width*tag_width) {
             res = 0;
             goto finish;
         }
@@ -10246,104 +10255,88 @@ int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct 
 
     // reject quads whose cumulative angle change isn't equal to 2PI
     if (1) {
-        float total = 0;
-
         for (int i = 0; i < 4; i++) {
             int i0 = i, i1 = (i+1)&3, i2 = (i+2)&3;
 
-            float theta0 = atan2f(quad->p[i0][1] - quad->p[i1][1],
-                                   quad->p[i0][0] - quad->p[i1][0]);
-            float theta1 = atan2f(quad->p[i2][1] - quad->p[i1][1],
-                                   quad->p[i2][0] - quad->p[i1][0]);
+            float dx1 = quad->p[i1][0] - quad->p[i0][0];
+            float dy1 = quad->p[i1][1] - quad->p[i0][1];
+            float dx2 = quad->p[i2][0] - quad->p[i1][0];
+            float dy2 = quad->p[i2][1] - quad->p[i1][1];
+            float cos_dtheta = (dx1*dx2 + dy1*dy2)/sqrt((dx1*dx1 + dy1*dy1)*(dx2*dx2 + dy2*dy2));
 
-            float dtheta = theta0 - theta1;
-            if (dtheta < 0)
-                dtheta += 2*M_PI;
-
-            if (dtheta < td->qtp.critical_rad || dtheta > (M_PI - td->qtp.critical_rad))
+            if ((cos_dtheta > td->qtp.cos_critical_rad || cos_dtheta < -td->qtp.cos_critical_rad) || dx1*dy2 < dy1*dx2) {
                 res = 0;
-
-            total += dtheta;
-        }
-
-        // looking for 2PI
-        if (total < 6.2 || total > 6.4) {
-            res = 0;
-            goto finish;
+                goto finish;
+            }
         }
     }
 
-    // adjust pixel coordinates; all math up 'til now uses pixel
-    // coordinates in which (0,0) is the lower left corner. But each
-    // pixel actually spans from to [x, x+1), [y, y+1) the mean value of which
-    // is +.5 higher than x & y.
-/*    float delta = .5;
-      for (int i = 0; i < 4; i++) {
-      quad->p[i][0] += delta;
-      quad->p[i][1] += delta;
-      }
-*/
   finish:
 
-    fb_free(); // lfps
+    fb_free(); // lfps;
 
     return res;
 }
 
-#ifdef OPTIMIZED
-#define DO_UNIONFIND(dx, dy) if (im->buf[y*s + dy*s + x + dx] == v) { broot = unionfind_get_representative(uf, y*w + dy*w + x + dx); if (aroot != broot) uf->data[broot].parent = aroot; }
+#define DO_UNIONFIND2(dx, dy) if (im->buf[(y + dy)*s + x + dx] == v) unionfind_connect(uf, y*w + x, (y + dy)*w + x + dx);
 
-static void do_unionfind_line(unionfind_t *uf, image_u8_t *im, int h, int w, int s, int y)
+static void do_unionfind_first_line(unionfind_t *uf, image_u8_t *im, int h, int w, int s)
 {
-    assert(y+1 < im->height);
-    uint8_t v, *p;
-    p = &im->buf[y*s + 1];
+    int y = 0;
+    uint8_t v;
+
     for (int x = 1; x < w - 1; x++) {
-        v = *p++; //im->buf[y*s + x];
+        v = im->buf[y*s + x];
 
         if (v == 127)
             continue;
-        uint32_t broot;
-        uint32_t aroot = unionfind_get_representative(uf, y*w+x);
-        // (dx,dy) pairs for 8 connectivity:
-        //          (REFERENCE) (1, 0)
-        // (-1, 1)    (0, 1)    (1, 1)
-        //
-        DO_UNIONFIND(1, 0);
-        DO_UNIONFIND(0, 1);
-        if (v == 255) {
-            DO_UNIONFIND(-1, 1);
-            DO_UNIONFIND(1, 1);
-        }
+
+        DO_UNIONFIND2(-1, 0);
     }
 }
-#else // not optimized
-#define DO_UNIONFIND(dx, dy) if (im->buf[y*s + dy*s + x + dx] == v) unionfind_connect(uf, y*w + x, y*w + dy*w + x + dx);
 
-static void do_unionfind_line(unionfind_t *uf, image_u8_t *im, int h, int w, int s, int y)
+static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int h, int w, int s, int y)
 {
-    assert(y+1 < im->height);
+    assert(y + 1 < im->height);
+    assert(y > 0);
+
+    uint8_t v_m1_m1;
+    uint8_t v_0_m1 = im->buf[(y - 1)*s];
+    uint8_t v_1_m1 = im->buf[(y - 1)*s + 1];
+    uint8_t v_m1_0;
+    uint8_t v = im->buf[y*s];
 
     for (int x = 1; x < w - 1; x++) {
-        uint8_t v = im->buf[y*s + x];
+        v_m1_m1 = v_0_m1;
+        v_0_m1 = v_1_m1;
+        v_1_m1 = im->buf[(y - 1)*s + x + 1];
+        v_m1_0 = v;
+        v = im->buf[y*s + x];
 
         if (v == 127)
             continue;
 
         // (dx,dy) pairs for 8 connectivity:
-        //          (REFERENCE) (1, 0)
-        // (-1, 1)    (0, 1)    (1, 1)
-        //
-        DO_UNIONFIND(1, 0);
-        DO_UNIONFIND(0, 1);
+        // (-1, -1)    (0, -1)    (1, -1)
+        // (-1, 0)    (REFERENCE)
+        DO_UNIONFIND2(-1, 0);
+
+        if (x == 1 || !((v_m1_0 == v_m1_m1) && (v_m1_m1 == v_0_m1))) {
+            DO_UNIONFIND2(0, -1);
+        }
+
         if (v == 255) {
-            DO_UNIONFIND(-1, 1);
-            DO_UNIONFIND(1, 1);
+            if (x == 1 || !(v_m1_0 == v_m1_m1 || v_0_m1 == v_m1_m1) ) {
+                DO_UNIONFIND2(-1, -1);
+            }
+            if (!(v_0_m1 == v_1_m1)) {
+                DO_UNIONFIND2(1, -1);
+            }
         }
     }
 }
-#undef DO_UNIONFIND
-#endif // OPTIMIZED
+#undef DO_UNIONFIND2
+
 
 image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
 {
@@ -10351,11 +10344,7 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     assert(w < 32768);
     assert(h < 32768);
 
-    image_u8_t *threshim = fb_alloc(sizeof(image_u8_t), FB_ALLOC_NO_HINT);
-    threshim->width = w;
-    threshim->height = h;
-    threshim->stride = s;
-    threshim->buf = fb_alloc(w * h, FB_ALLOC_NO_HINT);
+    image_u8_t *threshim = image_u8_create_alignment(w, h, s);
     assert(threshim->stride == s);
 
     // The idea is to find the maximum and minimum values in a
@@ -10387,6 +10376,7 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     // just use the min/max value from the last full tile.
     int tw = w / tilesz;
     int th = h / tilesz;
+
 
     uint8_t *im_max = fb_alloc(tw*th*sizeof(uint8_t), FB_ALLOC_NO_HINT);
     uint8_t *im_min = fb_alloc(tw*th*sizeof(uint8_t), FB_ALLOC_NO_HINT);
@@ -10563,6 +10553,7 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         fb_free(); // im_min_tmp
         fb_free(); // im_max_tmp
     }
+
 #if defined( OPTIMIZED ) && (defined(ARM_MATH_CM7) || defined(ARM_MATH_CM4))
     if ((s & 0x3) == 0 && tilesz == 4) // if each line is a multiple of 4, we can do this faster
     {
@@ -10689,11 +10680,7 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     // this is a dilate/erode deglitching scheme that does not improve
     // anything as far as I can tell.
     if (0 || td->qtp.deglitch) {
-        image_u8_t *tmp = fb_alloc(sizeof(image_u8_t), FB_ALLOC_NO_HINT);
-        tmp->width = w;
-        tmp->height = h;
-        tmp->stride = s;
-        tmp->buf = fb_alloc(w * h, FB_ALLOC_NO_HINT);
+        image_u8_t *tmp = image_u8_create(w, h);
 
         for (int y = 1; y + 1 < h; y++) {
             for (int x = 1; x + 1 < w; x++) {
@@ -10723,38 +10710,32 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
             }
         }
 
-        fb_free(); // tmp->buf
-        fb_free(); // tmp
+        image_u8_destroy(tmp);
     }
 
     return threshim;
 }
 
-zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, bool overrideMode)
+unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts)
 {
-    ////////////////////////////////////////////////////////
-    // step 1. threshold the image, creating the edge image.
-
-    int w = im->width, h = im->height;
-
-    image_u8_t *threshim = threshold(td, im);
-    int ts = threshim->stride;
-
-    ////////////////////////////////////////////////////////
-    // step 2. find connected components.
-
     unionfind_t *uf = unionfind_create(w * h);
 
-    for (int y = 0; y < h - 1; y++) {
-        do_unionfind_line(uf, threshim, h, w, ts, y);
+    do_unionfind_first_line(uf, threshim, h, w, ts);
+    for (int y = 1; y < h; y++) {
+      do_unionfind_line2(uf, threshim, h, w, ts, y);
     }
+    return uf;
+}
 
-    uint32_t nclustermap;
+zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, uint32_t nclustermap, unionfind_t* uf, zarray_t* clusters)
+{
     struct uint32_zarray_entry **clustermap = fb_alloc0_all(&nclustermap, FB_ALLOC_PREFER_SPEED);
+
     nclustermap /= sizeof(struct uint32_zarray_entry*);
     if (!nclustermap) fb_alloc_fail();
 
-    for (int y = 1; y < h-1; y++) {
+    // For 1 thread, y = 1; y < h - 1;
+    for (int y = y0; y < y1; y++) {
         for (int x = 1; x < w-1; x++) {
 
             uint8_t v0 = threshim->buf[y*ts + x];
@@ -10762,7 +10743,10 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, bool ove
                 continue;
 
             // XXX don't query this until we know we need it?
-            uint32_t rep0 = unionfind_get_representative(uf, y*w + x);
+            uint64_t rep0 = unionfind_get_representative(uf, y*w + x);
+            if (unionfind_get_set_size(uf, rep0) < 25) {
+                continue;
+            }
 
             // whenever we find two adjacent pixels such that one is
             // white and the other black, we add the point half-way
@@ -10786,39 +10770,37 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, bool ove
 
 #define DO_CONN(dx, dy)                                                 \
             if (1) {                                                    \
-                uint8_t v1 = threshim->buf[y*ts + dy*ts + x + dx];      \
+                uint8_t v1 = threshim->buf[y*ts + d*ts + x + dx];       \
                                                                         \
-                while (v0 + v1 == 255) {                                   \
+                if (v0 + v1 == 255) {                                   \
                     uint32_t rep1 = unionfind_get_representative(uf, y*w + dy*w + x + dx); \
-                    uint32_t clusterid;                                 \
-                    if (rep0 < rep1)                                    \
-                        clusterid = (rep1 << 16) + rep0;                \
-                    else                                                \
-                        clusterid = (rep0 << 16) + rep1;                \
-                                                                        \
-                    /* XXX lousy hash function */                       \
-                    uint32_t clustermap_bucket = u64hash_2(clusterid) % nclustermap; \
-                    struct uint32_zarray_entry *entry = clustermap[clustermap_bucket]; \
-                    while (entry && entry->id != clusterid)     {       \
-                        entry = entry->next;                            \
+                    if (unionfind_get_set_size(uf, rep1) > 24) {        \
+                        uint32_t clusterid;                                 \
+                        if (rep0 < rep1)                                    \
+                            clusterid = (rep1 << 16) + rep0;                \
+                        else                                                \
+                            clusterid = (rep0 << 16) + rep1;                \
+                                                                            \
+                        /* XXX lousy hash function */                       \
+                        uint32_t clustermap_bucket = u64hash_2(clusterid) % nclustermap; \
+                        struct uint32_zarray_entry *entry = clustermap[clustermap_bucket]; \
+                        while (entry && entry->id != clusterid) {           \
+                            entry = entry->next;                            \
+                        }                                                   \
+                                                                            \
+                        if (!entry) {                                       \
+                            entry = umm_calloc(1, sizeof(struct uint32_zarray_entry)); \
+                            if (!entry) break;                              \
+                                                                            \
+                            entry->id = clusterid;                          \
+                            entry->cluster = zarray_create_fail_ok(sizeof(struct pt)); \
+                            entry->next = clustermap[clustermap_bucket];    \
+                            clustermap[clustermap_bucket] = entry;          \
+                        }                                                   \
+                                                                            \
+                        struct pt p = { .x = 2*x + dx, .y = 2*y + dy, .gx = dx*((int) v1-v0), .gy = dy*((int) v1-v0)}; \
+                        zarray_add(entry->cluster, &p);                     \
                     }                                                   \
-                                                                        \
-                    if (!entry) {                                       \
-                        entry = umm_calloc(1, sizeof(struct uint32_zarray_entry)); \
-                        if (!entry) break;                              \
-                        entry->id = clusterid;                          \
-                        entry->cluster = zarray_create_fail_ok(sizeof(struct pt)); \
-                        if (!entry->cluster) {                          \
-                            free(entry);                                \
-                            break;                                      \
-                        }                                               \
-                        entry->next = clustermap[clustermap_bucket];    \
-                        clustermap[clustermap_bucket] = entry;          \
-                    }                                                   \
-                                                                        \
-                    struct pt p = { .x = 2*x + dx, .y = 2*y + dy, .gx = dx*((int) v1-v0), .gy = dy*((int) v1-v0)}; \
-                    zarray_add_fail_ok(entry->cluster, &p);             \
-                    break;                                              \
                 }                                                       \
             }
 
@@ -10835,19 +10817,33 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, bool ove
     }
 #undef DO_CONN
 
-    ////////////////////////////////////////////////////////
-    // step 3. process each connected component.
-    zarray_t *clusters = zarray_create_fail_ok(sizeof(zarray_t*)); //, uint32_zarray_hash_size(clustermap));
-    if (clusters) {
-        for (int i = 0; i < nclustermap; i++) {
+    for (int i = 0; i < nclustermap; i++) {
+        int start = zarray_size(clusters);
+        for (struct uint32_zarray_entry *entry = clustermap[i]; entry; entry = entry->next) {
+            struct cluster_hash* cluster_hash = malloc(sizeof(struct cluster_hash));
+            cluster_hash->hash = u64hash_2(entry->id) % nclustermap;
+            cluster_hash->id = entry->id;
+            cluster_hash->data = entry->cluster;
+            zarray_add_fail_ok(clusters, &cluster_hash);
+        }
+        int end = zarray_size(clusters);
 
-            for (struct uint32_zarray_entry *entry = clustermap[i]; entry; entry = entry->next) {
-                // XXX reject clusters here?
-                zarray_add_fail_ok(clusters, &entry->cluster);
+        // Do a quick bubblesort on the secondary key.
+        int n = end - start;
+        for (int j = 0; j < n - 1; j++) {
+            for (int k = 0; k < n - j - 1; k++) {
+                struct cluster_hash* hash1;
+                struct cluster_hash* hash2;
+                zarray_get(clusters, start + k, &hash1);
+                zarray_get(clusters, start + k + 1, &hash2);
+                if (hash1->id > hash2->id) {
+                    struct cluster_hash tmp = *hash2;
+                    *hash2 = *hash1;
+                    *hash1 = tmp;
+                }
             }
         }
     }
-
 
     int sz = clusters ? zarray_size(clusters) : 0;
 
@@ -10858,9 +10854,9 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, bool ove
           // free any leaked cluster (zarray_add_fail_ok)
           bool leaked = true;
           for (int j = 0; j < sz && leaked; j++) {
-              zarray_t *cluster;
-              zarray_get(clusters, j, &cluster);
-              leaked &= entry->cluster != cluster;
+              struct cluster_hash *cluster_hash;
+              zarray_get(clusters, j, &cluster_hash);
+              leaked &= entry->cluster != cluster_hash->data;
           }
           if (leaked) free(entry->cluster);
           struct uint32_zarray_entry *tmp = entry->next;
@@ -10868,63 +10864,128 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, bool ove
           entry = tmp;
         }
       }
-      fb_free(); // clustermap
     }
 
-    unionfind_destroy();
+    fb_free(); // clustermap
 
-    fb_free(); // threshim->buf
-    fb_free(); // threshim
+    return clusters;
+}
 
-    zarray_t *quads = zarray_create_fail_ok(sizeof(struct quad));
+zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf)
+{
+    zarray_t* clusters;
+    uint32_t nclustermap = 0.2 * w * h;
+    int sz = h - 1;
 
-    if (quads) {
-        for (int i = 0; i < sz; i++) {
+    zarray_t* clusters_for_gradient = zarray_create_fail_ok(sizeof(struct cluster_hash *));
 
-            zarray_t *cluster;
-            zarray_get(clusters, i, &cluster);
+    do_gradient_clusters(threshim, ts, 1, sz, w, nclustermap, uf, clusters_for_gradient);
 
-            if (zarray_size(cluster) < td->qtp.min_cluster_pixels)
-                continue;
+    /* Prepare output */
+    clusters = zarray_create(sizeof(zarray_t*));
+    zarray_ensure_capacity(clusters, zarray_size(clusters_for_gradient));
+    for (int i = 0; i < zarray_size(clusters_for_gradient); i++) {
+        struct cluster_hash* hash;
+        zarray_get(clusters_for_gradient, i, &hash);
+        zarray_add(clusters, &hash->data);
+        free(hash);
+    }
+    zarray_destroy(clusters_for_gradient);
+    return clusters;
+}
 
-            // a cluster should contain only boundary points around the
-            // tag. it cannot be bigger than the whole screen. (Reject
-            // large connected blobs that will be prohibitively slow to
-            // fit quads to.) A typical point along an edge is added three
-            // times (because it has 3 neighbors). The maximum perimeter
-            // is 2w+2h.
-            if (zarray_size(cluster) > 3*(2*w+2*h)) {
-                continue;
-            }
+zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, image_u8_t* im)
+{
+    zarray_t *quads = zarray_create(sizeof(struct quad));
 
-            struct quad quad;
-            memset(&quad, 0, sizeof(struct quad));
-
-            if (fit_quad(td, im, cluster, &quad, overrideMode)) {
-
-                zarray_add_fail_ok(quads, &quad);
-            }
+    bool normal_border = false;
+    bool reversed_border = false;
+    int min_tag_width = 1000000;
+    for (int i = 0; i < zarray_size(td->tag_families); i++) {
+        apriltag_family_t* family;
+        zarray_get(td->tag_families, i, &family);
+        if (family->width_at_border < min_tag_width) {
+            min_tag_width = family->width_at_border;
         }
+        normal_border |= !family->reversed_border;
+        reversed_border |= family->reversed_border;
+    }
+    min_tag_width /= td->quad_decimate;
+    if (min_tag_width < 3) {
+        min_tag_width = 3;
     }
 
-    //        printf("  %d %d %d %d\n", indices[0], indices[1], indices[2], indices[3]);
-
+    int sz = zarray_size(clusters);
     for (int i = 0; i < sz; i++) {
+      zarray_t *cluster;
+      zarray_get(clusters, i, &cluster);
+
+      if (zarray_size(cluster) < td->qtp.min_cluster_pixels)
+        continue;
+
+      // a cluster should contain only boundary points around the
+      // tag. it cannot be bigger than the whole screen. (Reject
+      // large connected blobs that will be prohibitively slow to
+      // fit quads to.) A typical point along an edge is added three
+      // times (because it has 3 neighbors). The maximum perimeter
+      // is 2w+2h.
+      if (zarray_size(cluster) > 3*(2*w+2*h)) {
+        continue;
+      }
+
+      struct quad quad;
+      memset(&quad, 0, sizeof(struct quad));
+
+      if (fit_quad(td, im, cluster, &quad, min_tag_width, normal_border, reversed_border)) {
+        zarray_add_fail_ok(quads, &quad);
+      }
+    }
+
+    return quads;
+}
+
+zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
+{
+    ////////////////////////////////////////////////////////
+    // step 1. threshold the image, creating the edge image.
+
+    int w = im->width, h = im->height;
+
+    image_u8_t *threshim = threshold(td, im);
+    int ts = threshim->stride;
+
+    ////////////////////////////////////////////////////////
+    // step 2. find connected components.
+    unionfind_t* uf = connected_components(td, threshim, w, h, ts);
+
+    // make segmentation image.
+    zarray_t* clusters = gradient_clusters(td, threshim, w, h, ts, uf);
+
+    unionfind_destroy(uf);
+    image_u8_destroy(threshim);
+
+    ////////////////////////////////////////////////////////
+    // step 3. process each connected component.
+
+    zarray_t* quads = fit_quads(td, w, h, clusters, im);
+
+    for (int i = 0; i < zarray_size(clusters); i++) {
         zarray_t *cluster;
         zarray_get(clusters, i, &cluster);
         zarray_destroy(cluster);
     }
+    zarray_destroy(clusters);
 
-    if (clusters) zarray_destroy(clusters);
+    // TODO: Consider it more deeply
+    // From OMV. Why? Perhaps it prevents returning the null object
+    // I think it's required if the quads object created with
+    // at2_zarray_create_fail_ok()
+    //    if (!quads) {
+    //      quads = at_zarray_create(sizeof(struct at2_quad));
+    //    }
 
-
-    if (!quads) {
-        // we should have enough memory now
-        quads = zarray_create(sizeof(struct quad));
-    }
     return quads;
 }
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //////// "apriltag.c"
 ////////////////////////////////////////////////////////////////////////////////////////////////////
