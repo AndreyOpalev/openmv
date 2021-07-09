@@ -860,7 +860,9 @@ typedef enum apriltag_families {
     TAG25H9 = 4,
     TAG36H10 = 8,
     TAG36H11 = 16,
-    ARTOOLKIT = 32
+    ARTOOLKIT = 32,
+    TAGCIRCLE21H7 = 64,
+    TAGSTANDARD41H12 = 128,
 } apriltag_families_t;
 
 typedef struct find_apriltags_list_lnk_data {

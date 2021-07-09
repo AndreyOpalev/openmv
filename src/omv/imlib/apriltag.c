@@ -5293,7 +5293,7 @@ struct apriltag_detection
 };
 
 // don't forget to add a family!
-apriltag_detector_t *apriltag_detector_create();
+apriltag_detector_t *apriltag_detector_create(float quad_decim);
 
 // add a family to the apriltag detector. caller still "owns" the family.
 // a single instance should only be provided to one apriltag detector instance.
@@ -11284,11 +11284,11 @@ void apriltag_detector_clear_families(apriltag_detector_t *td)
     zarray_clear(td->tag_families);
 }
 
-apriltag_detector_t *apriltag_detector_create()
+apriltag_detector_t *apriltag_detector_create(float quad_decim)
 {
     apriltag_detector_t *td = (apriltag_detector_t*) calloc(1, sizeof(apriltag_detector_t));
 
-    td->quad_decimate = 2.0;
+    td->quad_decimate = quad_decim;
     td->quad_sigma = 0.0;
 
     td->qtp.max_nmaxima = 10;
@@ -12137,14 +12137,28 @@ image_u8_t *apriltag_to_image(apriltag_family_t *fam, int idx)
 void imlib_find_apriltags(list_t *out, image_t *ptr, rectangle_t *roi, apriltag_families_t families,
                           float fx, float fy, float cx, float cy)
 {
+    // TODO: Fix that
+    // Decimated image should be w*h / 4 (in case of factor 4), but actually no because of some kind of optimization for 64-bit cache;
+    // For example, for 240*240 the decimated resolution is equal to w * h / 2.5
     // Frame Buffer Memory Usage...
-    // -> GRAYSCALE Input Image = w*h*1
-    // -> GRAYSCALE Threhsolded Image = w*h*1
-    // -> UnionFind = w*h*2 (+w*h*1 for hash table)
+
+    // -> GRAYSCALE Input Image (original) = w*h*1
+    // -> GRAYSCALE Decimated image        = w*h/(2*decimate)
+    // -> GRAYSCALE Threhsolded Image      = w*h/(2*decimate))
+    // -> UnionFind                        = 4*w*h/(2*decimate)
+    // --> For hash table (clustermap)     = 0.2 * 4*w*h/(2*decimate)
+    //                                     --------------------------
+    //                                     Total: w*h*(1 + 3.4 / decimate)
+    //
+    // In case of default decimation facotr of 2 = 2.7 * w * h
+    // Or without decimation = 4.4*w*h
+    float quad_decim = 2.0
     size_t resolution = roi->w * roi->h;
-    size_t fb_alloc_need = resolution * (1 + 1 + 2 + 1); // read above...
+    size_t fb_alloc_need = (size_t)((float)resolution * (1.0 + 3.4 / quad_decim))
+
     umm_init_x(((fb_avail() - fb_alloc_need) / resolution) * resolution);
-    apriltag_detector_t *td = apriltag_detector_create();
+
+    apriltag_detector_t *td = apriltag_detector_create(quad_decim);
 
     if (families & TAG16H5) {
         apriltag_detector_add_family(td, (apriltag_family_t *) &tag16h5);
@@ -12169,6 +12183,15 @@ void imlib_find_apriltags(list_t *out, image_t *ptr, rectangle_t *roi, apriltag_
     if (families & ARTOOLKIT) {
         apriltag_detector_add_family(td, (apriltag_family_t *) &artoolkit);
     }
+
+    if (families & TAGCIRCLE21H7) {
+        apriltag_detector_add_family(td, (apriltag_family_t *) &tagCircle21h7);
+    }
+
+    if (families & TAGSTANDARD41H12) {
+        apriltag_detector_add_family(td, (apriltag_family_t *) &tagStandard41h12);
+    }
+    // TODO: Add other tags that fit in memory
 
     uint8_t *grayscale_image = fb_alloc(roi->w * roi->h, FB_ALLOC_NO_HINT);
 
@@ -12265,10 +12288,21 @@ void imlib_find_apriltags(list_t *out, image_t *ptr, rectangle_t *roi, apriltag_
             lnk_data.family |= ARTOOLKIT;
         }
 
+        if (det->family == &tagCircle21h7) {
+            lnk_data.family |= TAGCIRCLE21H7;
+        }
+
+        if (det->family == &tagStandard41h12) {
+            lnk_data.family |= TAGSTANDARD41H12;
+        }
+
+        // TODO: Add other tags that fit in memory
+
         lnk_data.hamming = det->hamming;
         lnk_data.centroid.x = fast_roundf(det->c[0]) + roi->x;
         lnk_data.centroid.y = fast_roundf(det->c[1]) + roi->y;
-        lnk_data.goodness = det->goodness / 255.0; // scale to [0:1]
+        // TODO: Handle goodness
+        lnk_data.goodness = 0; //det->goodness / 255.0; // scale to [0:1]
         lnk_data.decision_margin = det->decision_margin / 255.0; // scale to [0:1]
 
         matd_t *pose = homography_to_pose(det->H, -fx, fy, cx, cy);
@@ -12294,14 +12328,23 @@ void imlib_find_apriltags(list_t *out, image_t *ptr, rectangle_t *roi, apriltag_
 #ifdef IMLIB_ENABLE_FIND_RECTS
 void imlib_find_rects(list_t *out, image_t *ptr, rectangle_t *roi, uint32_t threshold)
 {
-    // Frame Buffer Memory Usage...
-    // -> GRAYSCALE Input Image = w*h*1
-    // -> GRAYSCALE Threhsolded Image = w*h*1
-    // -> UnionFind = w*h*4 (+w*h*2 for hash table)
+    // -> GRAYSCALE Input Image (original) = w*h*1
+    // -> GRAYSCALE Decimated image        = w*h/(2*decimate)
+    // -> GRAYSCALE Threhsolded Image      = w*h/(2*decimate))
+    // -> UnionFind                        = 4*w*h/(2*decimate)
+    // --> For hash table (clustermap)     = 0.2 * 4*w*h/(2*decimate)
+    //                                     --------------------------
+    //                                     Total: w*h*(1 + 3.4 / decimate)
+    //
+    // In case of default decimation facotr of 2 = 2.7 * w * h
+    // Or without decimation = 4.4*w*h
+    float quad_decim = 1.0;
     size_t resolution = roi->w * roi->h;
-    size_t fb_alloc_need = resolution * (1 + 1 + 4 + 2); // read above...
+    size_t fb_alloc_need = (size_t)((float)resolution * (1.0 + 3.4 / quad_decim))
+
     umm_init_x(((fb_avail() - fb_alloc_need) / resolution) * resolution);
-    apriltag_detector_t *td = apriltag_detector_create();
+
+    apriltag_detector_t *td = apriltag_detector_create(quad_decim);
 
     image_t img;
     img.w = roi->w;
@@ -12320,17 +12363,90 @@ void imlib_find_rects(list_t *out, image_t *ptr, rectangle_t *roi, uint32_t thre
     // Detect quads according to requested image decimation
     // and blurring parameters.
 
-//    zarray_t *detections = apriltag_quad_gradient(td, &im, true);
-    zarray_t *detections = apriltag_quad_thresh(td, &im, true);
+    image_u8_t *quad_im = im_orig;
+    if (td->quad_decimate > 1) {
+        quad_im = image_u8_decimate(im_orig, td->quad_decimate);
+    }
+
+    if (td->quad_sigma != 0) {
+        // compute a reasonable kernel width by figuring that the
+        // kernel should go out 2 std devs.
+        //
+        // max sigma          ksz
+        // 0.499              1  (disabled)
+        // 0.999              3
+        // 1.499              5
+        // 1.999              7
+
+        float sigma = fabsf((float) td->quad_sigma);
+
+        int ksz = 4 * sigma; // 2 std devs in each direction
+        if ((ksz & 1) == 0)
+            ksz++;
+
+        if (ksz > 1) {
+
+            if (td->quad_sigma > 0) {
+                // Apply a blur
+                image_u8_gaussian_blur(quad_im, sigma, ksz);
+            } else {
+                // SHARPEN the image by subtracting the low frequency components.
+                image_u8_t *orig = image_u8_copy(quad_im);
+                image_u8_gaussian_blur(quad_im, sigma, ksz);
+
+                for (int y = 0; y < orig->height; y++) {
+                    for (int x = 0; x < orig->width; x++) {
+                        int vorig = orig->buf[y*orig->stride + x];
+                        int vblur = quad_im->buf[y*quad_im->stride + x];
+
+                        int v = 2*vorig - vblur;
+                        if (v < 0)
+                            v = 0;
+                        if (v > 255)
+                            v = 255;
+
+                        quad_im->buf[y*quad_im->stride + x] = (uint8_t) v;
+                    }
+                }
+                image_u8_destroy(orig);
+            }
+        }
+    }
+
+    zarray_t *quads = apriltag_quad_thresh(td, &quad_im);
+
+    // adjust centers of pixels so that they correspond to the
+    // original full-resolution image.
+    if (td->quad_decimate > 1) {
+        for (int i = 0; i < zarray_size(quads); i++) {
+            struct quad *q;
+            zarray_get_volatile(quads, i, &q);
+
+            for (int j = 0; j < 4; j++) {
+                if (td->quad_decimate == 1.5) {
+                    q->p[j][0] *= td->quad_decimate;
+                    q->p[j][1] *= td->quad_decimate;
+                } else {
+                    q->p[j][0] = (q->p[j][0] - 0.5)*td->quad_decimate + 0.5;
+                    q->p[j][1] = (q->p[j][1] - 0.5)*td->quad_decimate + 0.5;
+                }
+            }
+        }
+    }
+
+    if (quad_im != im)
+        image_u8_destroy(quad_im);
+
+    zarray_t *detections = zarray_create(sizeof(apriltag_detection_t*));
 
     td->nquads = zarray_size(detections);
 
     ////////////////////////////////////////////////////////////////
     // Decode tags from each quad.
     if (1) {
-        for (int i = 0; i < zarray_size(detections); i++) {
+        for (int quadidx = 0; quadidx < zarray_size(quads); quadidx++) {
             struct quad *quad_original;
-            zarray_get_volatile(detections, i, &quad_original);
+            zarray_get_volatile(quads, quadidx, &quad_original);
 
             // refine edges is not dependent upon the tag family, thus
             // apply this optimization BEFORE the other work.
@@ -12354,7 +12470,7 @@ void imlib_find_rects(list_t *out, image_t *ptr, rectangle_t *roi, uint32_t thre
 
         for (int i0 = 0; i0 < zarray_size(detections); i0++) {
 
-            struct quad *det0;
+            apriltag_detection_t *det0;
             zarray_get_volatile(detections, i0, &det0);
 
             for (int k = 0; k < 4; k++)
@@ -12362,8 +12478,11 @@ void imlib_find_rects(list_t *out, image_t *ptr, rectangle_t *roi, uint32_t thre
 
             for (int i1 = i0+1; i1 < zarray_size(detections); i1++) {
 
-                struct quad *det1;
+                apriltag_detection_t *det1;
                 zarray_get_volatile(detections, i1, &det1);
+
+                if (det0->id != det1->id || det0->family != det1->family)
+                    continue;
 
                 for (int k = 0; k < 4; k++)
                     zarray_set(poly1, k, det1->p[k], NULL);
@@ -12372,6 +12491,8 @@ void imlib_find_rects(list_t *out, image_t *ptr, rectangle_t *roi, uint32_t thre
                     // the tags overlap. Delete one, keep the other.
 
                     int pref = 0; // 0 means undecided which one we'll keep.
+                    pref = prefer_smaller(pref, det0->hamming, det1->hamming);     // want small hamming
+                    pref = prefer_smaller(pref, -det0->decision_margin, -det1->decision_margin);      // want bigger margins
 
                     // if we STILL don't prefer one detection over the other, then pick
                     // any deterministic criterion.
@@ -12388,15 +12509,13 @@ void imlib_find_rects(list_t *out, image_t *ptr, rectangle_t *roi, uint32_t thre
 
                     if (pref < 0) {
                         // keep det0, destroy det1
-                        matd_destroy(det1->H);
-                        matd_destroy(det1->Hinv);
+                        apriltag_detection_destroy(det1);
                         zarray_remove_index(detections, i1, 1);
                         i1--; // retry the same index
                         goto retry1;
                     } else {
                         // keep det1, destroy det0
-                        matd_destroy(det0->H);
-                        matd_destroy(det0->Hinv);
+                        apriltag_detection_destroy(det0);
                         zarray_remove_index(detections, i0, 1);
                         i0--; // retry the same index.
                         goto retry0;
